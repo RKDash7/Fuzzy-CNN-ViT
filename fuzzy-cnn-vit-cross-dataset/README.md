@@ -68,6 +68,4 @@ See [`validation/pcb/README.md`](validation/pcb/README.md) for the PCB dataset s
 
 
 
-## Data, weights, and results
 
-Datasets, downloaded archives, trained checkpoints, and generated result files are not included in this source repository. Follow the upstream dataset terms and citation requirements before use or redistribution. Do not commit large datasets, private data, or model checkpoints unless appropriate.
