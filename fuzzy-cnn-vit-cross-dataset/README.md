@@ -66,11 +66,7 @@ python validation/pcb/pcb_defect_classification.py
 
 See [`validation/pcb/README.md`](validation/pcb/README.md) for the PCB dataset source, VOC XML processing, defect classes, outputs, and experimental caveats.
 
-## Important research-protocol note
 
-The PCB script is preserved as the supplied validation workflow. Its current training loop selects/saves a checkpoint using test accuracy, and its split is performed at the defect-crop level. **Do not report the resulting PCB test metrics as an unbiased held-out evaluation without correcting these issues.** For defensible cross-dataset validation, use a training/validation/test protocol, select checkpoints using validation data only, and split by original PCB image filename so crops from one source image cannot appear in both training and testing. Keep the final PCB test set untouched until the final evaluation.
-
-Also verify that the PCB implementation and preprocessing exactly match the proposed model definition used in the primary experiment before describing it as a strict architecture-level cross-dataset validation. The supplied PCB script has its own CNN/attention implementation; the repository documentation does not silently claim that it is identical to the NEU-DET Fuzzy CNN–ViT implementation.
 
 ## Data, weights, and results
 
