@@ -319,7 +319,7 @@ class TransformerBlock(nn.Module):
     def __init__(
         self,
         embed_dim=128,
-        num_heads=8,
+        num_heads=4,
         mlp_dim=512,
         dropout=0.1
     ):
@@ -374,7 +374,7 @@ class FuzzyCNNViT(nn.Module):
         image_size=128,
         num_classes=6,
         embed_dim=128,
-        num_heads=8,
+        num_heads=4,
         mlp_dim=512,
         dropout=0.1
     ):
@@ -474,7 +474,7 @@ model = FuzzyCNNViT(
     image_size=IMAGE_SIZE,
     num_classes=num_classes,
     embed_dim=128,
-    num_heads=8,
+    num_heads=4,
     mlp_dim=512,
     dropout=0.1
 ).to(device)
@@ -1084,3 +1084,528 @@ for filename in sorted(os.listdir(output_dir)):
     print(filename)
 
 print("\nResults directory:", output_dir)
+
+
+
+# ================================================================
+# 22. EXPLAINABILITY: GRAD-CAM vs TRANSFORMER CLS ATTENTION
+# ================================================================
+# This section is integrated for the exact FuzzyCNNViT architecture
+# defined above. It uses:
+#   Grad-CAM target: model.cnn.conv2[0]
+#   Attention tensor: model.last_attention
+#
+# IMPORTANT:
+# The supplied architecture contains ONE TransformerBlock.
+# Therefore, its attention explanation is single-layer CLS attention,
+# not multi-layer attention rollout.
+
+from skimage.metrics import structural_similarity as structural_ssim
+from sklearn.metrics import auc as sklearn_auc
+
+EXPLAINABILITY_DIR = os.path.join(
+    output_dir, "Explainability_Results"
+)
+os.makedirs(EXPLAINABILITY_DIR, exist_ok=True)
+
+
+def normalize_explanation_map(explanation):
+    """Convert explanation to per-image normalized [B,1,H,W] maps."""
+    if explanation.ndim == 3:
+        explanation = explanation.unsqueeze(1)
+
+    if explanation.ndim != 4:
+        raise ValueError(
+            f"Expected explanation [B,1,H,W], got {tuple(explanation.shape)}"
+        )
+
+    if explanation.shape[1] != 1:
+        explanation = explanation.mean(dim=1, keepdim=True)
+
+    explanation = torch.relu(explanation)
+    batch_size = explanation.shape[0]
+    flat = explanation.reshape(batch_size, -1)
+
+    minimum = flat.min(dim=1, keepdim=True).values
+    maximum = flat.max(dim=1, keepdim=True).values
+
+    flat = (flat - minimum) / (maximum - minimum + 1e-8)
+
+    return flat.reshape(
+        batch_size, 1, explanation.shape[-2], explanation.shape[-1]
+    )
+
+
+def resize_explanation_map(explanation, images):
+    return F.interpolate(
+        explanation,
+        size=images.shape[-2:],
+        mode="bilinear",
+        align_corners=False
+    )
+
+
+@torch.no_grad()
+def target_class_confidence(model, images, labels):
+    logits = model(images)
+    probabilities = torch.softmax(logits, dim=1)
+    return probabilities.gather(
+        1, labels.view(-1, 1)
+    ).squeeze(1)
+
+
+def generate_gradcam(model, images, labels, target_layer):
+    """Grad-CAM for the selected convolutional layer."""
+    captured = {}
+
+    def forward_hook(module, inputs, output):
+        captured["activation"] = output
+
+    handle = target_layer.register_forward_hook(forward_hook)
+
+    try:
+        model.zero_grad(set_to_none=True)
+
+        with torch.enable_grad():
+            logits = model(images)
+            activations = captured.get("activation")
+
+            if activations is None:
+                raise RuntimeError(
+                    "The selected Grad-CAM layer did not produce activations."
+                )
+
+            selected_scores = logits.gather(
+                1, labels.view(-1, 1)
+            ).sum()
+
+            gradients = torch.autograd.grad(
+                selected_scores,
+                activations,
+                retain_graph=False,
+                create_graph=False
+            )[0]
+
+            channel_weights = gradients.mean(
+                dim=(2, 3), keepdim=True
+            )
+
+            cam = torch.relu(
+                (channel_weights * activations).sum(dim=1, keepdim=True)
+            )
+
+        return cam.detach()
+
+    finally:
+        handle.remove()
+        model.zero_grad(set_to_none=True)
+
+
+@torch.no_grad()
+def generate_transformer_cls_attention(model, images):
+    """
+    Extract CLS-token-to-patch attention from the supplied single
+    TransformerBlock. Expected stored tensor: [B, heads, tokens, tokens].
+    """
+    _ = model(images)
+
+    attention = model.last_attention
+
+    if attention is None:
+        raise RuntimeError(
+            "model.last_attention is None. The model forward pass "
+            "did not store attention weights."
+        )
+
+    if attention.ndim != 4:
+        raise ValueError(
+            "Expected model.last_attention shape [B, heads, tokens, tokens], "
+            f"but received {tuple(attention.shape)}."
+        )
+
+    # Average attention across heads: [B, tokens, tokens]
+    attention = attention.mean(dim=1)
+
+    # CLS token attending to all image patch tokens
+    cls_to_patches = attention[:, 0, 1:]
+
+    patch_count = cls_to_patches.shape[1]
+    grid_size = int(np.sqrt(patch_count))
+
+    if grid_size * grid_size != patch_count:
+        raise ValueError(
+            f"{patch_count} patch tokens cannot be reshaped into a square grid."
+        )
+
+    attention_map = cls_to_patches.reshape(
+        images.shape[0], 1, grid_size, grid_size
+    )
+
+    return attention_map
+
+
+@torch.no_grad()
+def calculate_average_drop_increase(
+    model, images, explanations, labels, keep_ratio=0.20
+):
+    explanations = resize_explanation_map(explanations, images)
+
+    batch_size, _, height, width = images.shape
+    flat = explanations.flatten(1)
+    total_pixels = height * width
+    keep_count = max(1, int(total_pixels * keep_ratio))
+
+    top_indices = torch.topk(
+        flat, keep_count, dim=1
+    ).indices
+
+    mask = torch.zeros_like(flat)
+    mask.scatter_(1, top_indices, 1.0)
+    mask = mask.reshape(batch_size, 1, height, width)
+
+    original_confidence = target_class_confidence(
+        model, images, labels
+    )
+
+    # Keep only the most salient pixels; remaining pixels use zero baseline.
+    retained_images = images * mask
+
+    retained_confidence = target_class_confidence(
+        model, retained_images, labels
+    )
+
+    average_drop = (
+        torch.clamp(
+            original_confidence - retained_confidence, min=0
+        ) / (original_confidence + 1e-8)
+    ) * 100.0
+
+    average_increase = (
+        retained_confidence > original_confidence
+    ).float() * 100.0
+
+    return (
+        average_drop.cpu().numpy(),
+        average_increase.cpu().numpy()
+    )
+
+
+@torch.no_grad()
+def calculate_deletion_insertion_auc(
+    model, images, explanations, labels, steps=20
+):
+    explanations = resize_explanation_map(explanations, images)
+
+    batch_size, _, height, width = images.shape
+    total_pixels = height * width
+
+    sorted_indices = torch.argsort(
+        explanations.flatten(1),
+        dim=1,
+        descending=True
+    )
+
+    deletion_curve = []
+    insertion_curve = []
+
+    # Zero is the baseline in the model's normalized input space.
+    baseline = torch.zeros_like(images)
+
+    for step in range(steps + 1):
+        number_to_change = int(total_pixels * step / steps)
+
+        mask_flat = torch.zeros(
+            batch_size,
+            total_pixels,
+            device=images.device,
+            dtype=images.dtype
+        )
+
+        if number_to_change > 0:
+            mask_flat.scatter_(
+                1,
+                sorted_indices[:, :number_to_change],
+                1.0
+            )
+
+        mask = mask_flat.reshape(
+            batch_size, 1, height, width
+        )
+
+        # Deletion: remove salient pixels progressively.
+        deleted_images = images * (1.0 - mask) + baseline * mask
+
+        # Insertion: restore salient pixels progressively.
+        inserted_images = baseline * (1.0 - mask) + images * mask
+
+        deletion_confidence = target_class_confidence(
+            model, deleted_images, labels
+        )
+        insertion_confidence = target_class_confidence(
+            model, inserted_images, labels
+        )
+
+        deletion_curve.append(deletion_confidence.cpu().numpy())
+        insertion_curve.append(insertion_confidence.cpu().numpy())
+
+    deletion_curve = np.stack(deletion_curve, axis=0)
+    insertion_curve = np.stack(insertion_curve, axis=0)
+
+    x_axis = np.linspace(0.0, 1.0, steps + 1)
+
+    deletion_auc = np.array([
+        sklearn_auc(x_axis, deletion_curve[:, i])
+        for i in range(batch_size)
+    ])
+
+    insertion_auc = np.array([
+        sklearn_auc(x_axis, insertion_curve[:, i])
+        for i in range(batch_size)
+    ])
+
+    return deletion_auc, insertion_auc
+
+
+def calculate_stability_ssim(
+    original_explanation, perturbed_explanation
+):
+    original = normalize_explanation_map(
+        original_explanation
+    ).detach().cpu().numpy()
+
+    perturbed = normalize_explanation_map(
+        perturbed_explanation
+    ).detach().cpu().numpy()
+
+    scores = []
+
+    for index in range(original.shape[0]):
+        scores.append(
+            structural_ssim(
+                original[index, 0],
+                perturbed[index, 0],
+                data_range=1.0
+            )
+        )
+
+    return np.asarray(scores, dtype=float)
+
+
+def evaluate_explainability_comparison(
+    model,
+    loader,
+    device,
+    output_directory,
+    keep_ratio=0.20,
+    deletion_steps=20,
+    noise_std=0.05,
+    seed=42
+):
+    os.makedirs(output_directory, exist_ok=True)
+
+    # Exact layer name from the uploaded CNNFeatureExtractor class.
+    gradcam_target_layer = model.cnn.conv2[0]
+
+    if not isinstance(gradcam_target_layer, nn.Conv2d):
+        raise TypeError(
+            "model.cnn.conv2[0] is not nn.Conv2d. "
+            "Check the CNNFeatureExtractor definition."
+        )
+
+    print("Grad-CAM target layer:", gradcam_target_layer)
+    print("Stored attention tensor:", "model.last_attention")
+
+    methods = [
+        (
+            "Grad-CAM",
+            lambda x, y: generate_gradcam(
+                model, x, y, gradcam_target_layer
+            )
+        ),
+        (
+            "Transformer CLS Attention",
+            lambda x, y: generate_transformer_cls_attention(
+                model, x
+            )
+        )
+    ]
+
+    result_rows = []
+    global_image_index = 0
+
+    model.eval()
+
+    for method_name, explanation_function in methods:
+        print(f"\nEvaluating {method_name} ...")
+        image_index = 0
+
+        for batch_index, (images, labels) in enumerate(loader):
+            images = images.to(device)
+            labels = labels.to(device)
+
+            # Generate and normalize explanation maps.
+            explanations = explanation_function(images, labels)
+            explanations = normalize_explanation_map(explanations)
+
+            # Faithfulness metrics.
+            average_drop, average_increase = (
+                calculate_average_drop_increase(
+                    model,
+                    images,
+                    explanations,
+                    labels,
+                    keep_ratio=keep_ratio
+                )
+            )
+
+            deletion_auc, insertion_auc = (
+                calculate_deletion_insertion_auc(
+                    model,
+                    images,
+                    explanations,
+                    labels,
+                    steps=deletion_steps
+                )
+            )
+
+            # Perturb inputs with deterministic Gaussian noise.
+            generator = torch.Generator(device=device)
+            generator.manual_seed(seed + batch_index)
+
+            noise = torch.randn(
+                images.shape,
+                generator=generator,
+                device=device,
+                dtype=images.dtype
+            ) * noise_std
+
+            perturbed_images = torch.clamp(
+                images + noise, min=-1.0, max=1.0
+            )
+
+            perturbed_explanations = explanation_function(
+                perturbed_images, labels
+            )
+
+            stability = calculate_stability_ssim(
+                explanations,
+                perturbed_explanations
+            )
+
+            for i in range(images.shape[0]):
+                result_rows.append({
+                    "Method": method_name,
+                    "Image_Index": image_index + i,
+                    "True_Class_Index": int(labels[i].item()),
+                    "True_Class": class_names[int(labels[i].item())],
+                    "Average_Drop_pct": float(average_drop[i]),
+                    "Average_Increase_pct": float(average_increase[i]),
+                    "Deletion_AUC": float(deletion_auc[i]),
+                    "Insertion_AUC": float(insertion_auc[i]),
+                    "Stability_SSIM": float(stability[i])
+                })
+
+            image_index += images.shape[0]
+
+            print(
+                f"  Batch {batch_index + 1}/{len(loader)} "
+                f"completed ({image_index} images)"
+            )
+
+        if image_index == 0:
+            raise RuntimeError("The test DataLoader returned no images.")
+
+        if global_image_index == 0:
+            global_image_index = image_index
+        elif image_index != global_image_index:
+            raise RuntimeError(
+                "The two methods were not evaluated on the same number of images."
+            )
+
+    per_image_df = pd.DataFrame(result_rows)
+
+    per_image_file = os.path.join(
+        output_directory, "explainability_per_image.csv"
+    )
+    per_image_df.to_csv(per_image_file, index=False)
+
+    metrics = [
+        "Average_Drop_pct",
+        "Average_Increase_pct",
+        "Deletion_AUC",
+        "Insertion_AUC",
+        "Stability_SSIM"
+    ]
+
+    summary_rows = []
+
+    for method_name in per_image_df["Method"].unique():
+        subset = per_image_df[
+            per_image_df["Method"] == method_name
+        ]
+
+        row = {
+            "Method": method_name,
+            "Number_of_images": len(subset)
+        }
+
+        for metric in metrics:
+            row[metric + "_Mean"] = subset[metric].mean()
+            row[metric + "_Std"] = subset[metric].std(ddof=1)
+
+        summary_rows.append(row)
+
+    summary_df = pd.DataFrame(summary_rows)
+
+    summary_file = os.path.join(
+        output_directory, "explainability_summary.csv"
+    )
+    summary_df.to_csv(summary_file, index=False)
+
+    print("\n========== EXPLAINABILITY RESULTS ==========")
+    print(summary_df.round(6).to_string(index=False))
+
+    print("\nFiles saved:")
+    print(per_image_file)
+    print(summary_file)
+
+    for path in [per_image_file, summary_file]:
+        if not os.path.isfile(path) or os.path.getsize(path) == 0:
+            raise RuntimeError(f"Output file was not created correctly: {path}")
+
+    print("\nVerified output files:")
+    for filename in sorted(os.listdir(output_directory)):
+        print(filename)
+
+    return per_image_df, summary_df
+
+
+# ================================================================
+# 23. RUN EXPLAINABILITY EVALUATION
+# ================================================================
+
+# The original script has already:
+#   1. Created test_loader.
+#   2. Loaded best_fuzzy_cnn_vit.pth.
+#   3. Restored the best model weights.
+#
+# Run the evaluation on the 288-image test set.
+
+explainability_per_image, explainability_summary = (
+    evaluate_explainability_comparison(
+        model=model,
+        loader=test_loader,
+        device=device,
+        output_directory=EXPLAINABILITY_DIR,
+        keep_ratio=0.20,
+        deletion_steps=20,
+        noise_std=0.05,
+        seed=SEED
+    )
+)
+
+# Display results in the notebook.
+display(explainability_summary)
+display(explainability_per_image.head())
+
+print("\nExplainability output directory:", EXPLAINABILITY_DIR)
