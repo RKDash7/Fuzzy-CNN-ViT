@@ -53,7 +53,7 @@ For Google Colab, clone this repository and run the desired script from its own 
 ## Run the primary NEU-DET experiment
 
 ```bash
-python experiments/neu_det/neu_det_fuzzy_cnn_vit.py
+python experiments/neu_det/Explainable_Fuzzy_CNN_ViT.py
 ```
 
 See [`experiments/neu_det/README.md`](experiments/neu_det/README.md) for the dataset layout, split, architecture, training configuration, and outputs.
