@@ -1,309 +1,244 @@
-"""
-Grad-CAM vs. CLS-attention explainability evaluation for NEU-DET.
-
-This is an evaluation module, not a model-definition file. Construct your
-FuzzyCNNViT model, load the trained checkpoint, and create test_loader using
-the SAME split/preprocessing as the training experiment. Then call
-run_explainability_evaluation(...).
-
-Important:
-- Average Drop is computed from the image retaining salient pixels only.
-- Average Increase uses the same retained image.
-- Metrics are accumulated per image, so a smaller final batch is weighted
-  correctly.
-- The attention function below extracts CLS-to-patch attention from the
-  model's last transformer layer. If only one layer is used, call it
-  "CLS Attention" rather than multi-layer Attention Rollout.
-- The default Grad-CAM target layer assumes model.cnn[4], as in the supplied
-  implementation. Change target_layer_getter if your architecture differs.
-"""
-
-from __future__ import annotations
-
-import os
-import random
-from typing import Callable, Optional
-
-import numpy as np
-import pandas as pd
 import torch
 import torch.nn.functional as F
+import numpy as np
+import pandas as pd
 from sklearn.metrics import auc
 from skimage.metrics import structural_similarity as ssim
+import os
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms
+from sklearn.model_selection import train_test_split
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def set_reproducibility(seed: int = 42) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+# --------------------------------------------------
+# 0. Recreate Model, DataLoader and Load Saved Weights
+# --------------------------------------------------
+IMAGE_SIZE = 128
+BATCH_SIZE = 32
+NUM_WORKERS = 2
+TRAIN_DIR = "/content/data/NEU-DET/train/images"
 
+eval_transform = transforms.Compose([
+    transforms.Grayscale(num_output_channels=1),
+    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize((0.5,), (0.5,))
+])
 
-@torch.no_grad()
-def get_confidence(model, images: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    """Return the softmax probability assigned to each image's target class."""
-    logits = model(images)
-    probabilities = torch.softmax(logits, dim=1)
-    return probabilities.gather(1, targets.view(-1, 1)).squeeze(1)
+eval_train = datasets.ImageFolder(TRAIN_DIR, transform=eval_transform)
+num_classes = len(eval_train.classes)
 
+all_indices = np.arange(len(eval_train))
+all_targets = np.array(eval_train.targets)
 
-def normalize_explanation(explanation: torch.Tensor) -> torch.Tensor:
-    """Per-image min-max normalization; returns [B,1,h,w]."""
-    if explanation.ndim == 3:
-        explanation = explanation.unsqueeze(1)
-    if explanation.ndim != 4:
-        raise ValueError(f"Expected explanation [B,1,H,W], got {tuple(explanation.shape)}")
-    if explanation.shape[1] != 1:
-        explanation = explanation.mean(dim=1, keepdim=True)
+_, test_indices = train_test_split(
+    all_indices,
+    test_size=0.20,
+    stratify=all_targets,
+    random_state=42
+)
 
+test_data = Subset(eval_train, test_indices)
+test_loader = DataLoader(
+    test_data,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=NUM_WORKERS,
+    pin_memory=torch.cuda.is_available()
+)
+
+model = FuzzyCNNViT(num_classes=num_classes).to(device)
+checkpoint_path = os.path.join(OUTPUT_DIR, "best_model_run_1_seed_42.pth")
+if os.path.exists(checkpoint_path):
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    print(f"Successfully loaded best model from: {checkpoint_path}")
+else:
+    print("Warning: Saved model weights not found. Using randomly initialized model.")
+model.eval()
+
+# --------------------------------------------------
+# 1. Normalize explanation maps
+# --------------------------------------------------
+def normalize_explanation(explanation):
     explanation = torch.clamp(explanation, min=0)
-    batch = explanation.shape[0]
-    flat = explanation.reshape(batch, -1)
-    minimum = flat.min(dim=1, keepdim=True).values
-    maximum = flat.max(dim=1, keepdim=True).values
-    flat = (flat - minimum) / (maximum - minimum + 1e-8)
-    return flat.reshape(batch, 1, explanation.shape[-2], explanation.shape[-1])
-
-
-def resize_explanations(explanations: torch.Tensor, images: torch.Tensor) -> torch.Tensor:
-    return F.interpolate(
-        explanations,
-        size=images.shape[-2:],
-        mode="bilinear",
-        align_corners=False,
+    B = explanation.shape[0]
+    explanation = explanation.reshape(B, -1)
+    minimum = explanation.min(dim=1, keepdim=True)[0]
+    maximum = explanation.max(dim=1, keepdim=True)[0]
+    explanation = (explanation - minimum) / (maximum - minimum + 1e-8)
+    return explanation.reshape(
+        B, 1, int(np.sqrt(explanation.shape[1])),
+        int(np.sqrt(explanation.shape[1]))
     )
 
-
+# --------------------------------------------------
+# 2. Prediction confidence
+# --------------------------------------------------
 @torch.no_grad()
-def average_drop_increase_per_image(
-    model,
-    images: torch.Tensor,
-    explanations: torch.Tensor,
-    targets: torch.Tensor,
-    keep_ratio: float = 0.20,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Compute standard Average Drop and Average Increase for each image.
+def get_confidence(model, images, targets):
+    outputs = model(images)
+    probabilities = torch.softmax(outputs, dim=1)
+    confidence = probabilities.gather(1, targets.view(-1, 1)).squeeze(1)
+    return confidence
 
-    The retained image contains the top-ranked salient pixels; all other
-    pixels are replaced by the zero baseline in normalized input space.
-    """
-    if not 0 < keep_ratio <= 1:
-        raise ValueError("keep_ratio must be in (0, 1].")
-
-    batch, _, height, width = images.shape
-    explanations = resize_explanations(explanations, images)
-    flat = explanations.flatten(1)
-    k = max(1, int(height * width * keep_ratio))
-
-    top_indices = torch.topk(flat, k, dim=1).indices
-    mask = torch.zeros_like(flat)
-    mask.scatter_(1, top_indices, 1.0)
-    mask = mask.reshape(batch, 1, height, width)
-
+# --------------------------------------------------
+# 3. Average Drop and Average Increase
+# --------------------------------------------------
+@torch.no_grad()
+def average_drop_increase(
+    model, images, explanations, targets,
+    keep_ratio=0.2
+):
+    B, C, H, W = images.shape
     original_conf = get_confidence(model, images, targets)
-    retained_images = images * mask
+    explanations = F.interpolate(
+        explanations,
+        size=(H, W),
+        mode="bilinear",
+        align_corners=False
+    )
+    flat_exp = explanations.flatten(1)
+    k = max(1, int(H * W * keep_ratio))
+    indices = torch.topk(flat_exp, k, dim=1).indices
+    masks = torch.zeros_like(flat_exp)
+    masks.scatter_(1, indices, 1)
+    masks = masks.reshape(B, 1, H, W)
+
+    retained_images = images * masks
     retained_conf = get_confidence(model, retained_images, targets)
 
+    removed_images = images * (1 - masks)
+    removed_conf = get_confidence(model, removed_images, targets)
+
     average_drop = (
-        torch.clamp(original_conf - retained_conf, min=0)
+        torch.clamp(original_conf - removed_conf, min=0)
         / (original_conf + 1e-8)
-    ) * 100.0
+    ).mean().item() * 100
 
-    average_increase = (retained_conf > original_conf).float() * 100.0
+    average_increase = (
+        retained_conf > original_conf
+    ).float().mean().item() * 100
 
-    return (
-        average_drop.detach().cpu().numpy(),
-        average_increase.detach().cpu().numpy(),
-    )
+    return average_drop, average_increase
 
-
+# --------------------------------------------------
+# 4. Deletion and Insertion AUC
+# --------------------------------------------------
 @torch.no_grad()
-def deletion_insertion_auc_per_image(
-    model,
-    images: torch.Tensor,
-    explanations: torch.Tensor,
-    targets: torch.Tensor,
-    steps: int = 20,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compute deletion and insertion AUC separately for every image."""
-    if steps < 1:
-        raise ValueError("steps must be >= 1.")
-
-    batch, _, height, width = images.shape
-    explanations = resize_explanations(explanations, images)
-    flat = explanations.flatten(1)
-    sorted_indices = torch.argsort(flat, dim=1, descending=True)
-
-    total_pixels = height * width
+def deletion_insertion_auc(
+    model, images, explanations, targets,
+    steps=20
+):
+    B, C, H, W = images.shape
+    explanations = F.interpolate(
+        explanations,
+        size=(H, W),
+        mode="bilinear",
+        align_corners=False
+    )
+    flat_exp = explanations.flatten(1)
+    sorted_indices = torch.argsort(flat_exp, dim=1, descending=True)
+    total_pixels = H * W
     baseline = torch.zeros_like(images)
+
     deletion_curve = []
     insertion_curve = []
 
     for step in range(steps + 1):
-        k = int(total_pixels * step / steps)
-        mask_flat = torch.zeros(
-            batch, total_pixels, device=images.device, dtype=images.dtype
-        )
+        fraction = step / steps
+        k = int(total_pixels * fraction)
+        mask = torch.zeros(B, total_pixels, device=images.device)
         if k > 0:
-            mask_flat.scatter_(1, sorted_indices[:, :k], 1.0)
-        mask = mask_flat.reshape(batch, 1, height, width)
+            selected = sorted_indices[:, :k]
+            mask.scatter_(1, selected, 1)
+        mask = mask.reshape(B, 1, H, W)
 
-        deleted = images * (1.0 - mask) + baseline * mask
-        inserted = baseline * (1.0 - mask) + images * mask
+        deleted = images * (1 - mask) + baseline * mask
+        inserted = baseline * (1 - mask) + images * mask
 
-        deletion_curve.append(get_confidence(model, deleted, targets))
-        insertion_curve.append(get_confidence(model, inserted, targets))
+        deletion_conf = get_confidence(model, deleted, targets).mean().item()
+        insertion_conf = get_confidence(model, inserted, targets).mean().item()
 
-    # [steps+1, batch] -> calculate AUC for each image independently.
-    deletion_values = torch.stack(deletion_curve).cpu().numpy()
-    insertion_values = torch.stack(insertion_curve).cpu().numpy()
-    x = np.linspace(0.0, 1.0, steps + 1)
+        deletion_curve.append(deletion_conf)
+        insertion_curve.append(insertion_conf)
 
-    deletion_auc = np.array(
-        [auc(x, deletion_values[:, i]) for i in range(batch)], dtype=float
-    )
-    insertion_auc = np.array(
-        [auc(x, insertion_values[:, i]) for i in range(batch)], dtype=float
-    )
+    x = np.linspace(0, 1, steps + 1)
+    deletion_auc = auc(x, deletion_curve)
+    insertion_auc = auc(x, insertion_curve)
+
     return deletion_auc, insertion_auc
 
-
-def explanation_stability_per_image(
-    explanation_original: torch.Tensor,
-    explanation_perturbed: torch.Tensor,
-) -> np.ndarray:
-    """SSIM between original and noise-perturbed explanation maps."""
-    original = normalize_explanation(explanation_original).detach().cpu().numpy()
-    perturbed = normalize_explanation(explanation_perturbed).detach().cpu().numpy()
-
+# --------------------------------------------------
+# 5. Explanation stability using SSIM
+# --------------------------------------------------
+def explanation_stability(explanation_original, explanation_perturbed):
+    original = explanation_original.detach().cpu().numpy()
+    perturbed = explanation_perturbed.detach().cpu().numpy()
     scores = []
     for i in range(original.shape[0]):
-        a = original[i, 0]
-        b = perturbed[i, 0]
-        scores.append(ssim(a, b, data_range=1.0))
-    return np.asarray(scores, dtype=float)
+        a = original[i].squeeze()
+        b = perturbed[i].squeeze()
+        score = ssim(a, b, data_range=1.0)
+        scores.append(score)
+    return np.mean(scores)
 
+# --------------------------------------------------
+# 6. Explanation Functions Definition
+# --------------------------------------------------
+def gradcam_fn(model, images, labels):
+    model.zero_grad()
+    activations = []
+    gradients = []
 
-def gradcam_fn(
-    model,
-    images: torch.Tensor,
-    labels: torch.Tensor,
-    target_layer: Optional[torch.nn.Module] = None,
-) -> torch.Tensor:
-    """
-    Grad-CAM implementation.
+    def forward_hook(module, input, output):
+        activations.append(output)
 
-    By default, uses model.cnn[4], matching the code supplied in the chat.
-    Pass target_layer explicitly if your model uses a different final CNN layer.
-    """
-    if target_layer is None:
-        try:
-            target_layer = model.cnn[4]
-        except Exception as exc:
-            raise AttributeError(
-                "Could not access model.cnn[4]. Pass the correct target_layer."
-            ) from exc
+    def backward_hook(module, grad_input, grad_output):
+        gradients.append(grad_output[0])
 
-    activations = {}
+    target_layer = model.cnn[4]
+    h1 = target_layer.register_forward_hook(forward_hook)
+    h2 = target_layer.register_full_backward_hook(backward_hook)
 
-    def forward_hook(_module, _inputs, output):
-        activations["value"] = output
+    outputs = model(images)
+    score = outputs.gather(1, labels.view(-1, 1)).squeeze(1)
+    score.backward(torch.ones_like(score))
 
-    handle = target_layer.register_forward_hook(forward_hook)
-    model.zero_grad(set_to_none=True)
+    h1.remove()
+    h2.remove()
 
-    try:
-        with torch.enable_grad():
-            logits = model(images)
-            scores = logits.gather(1, labels.view(-1, 1)).sum()
-            feature_maps = activations.get("value")
-            if feature_maps is None:
-                raise RuntimeError("Grad-CAM target layer did not produce activations.")
-            gradients = torch.autograd.grad(
-                outputs=scores,
-                inputs=feature_maps,
-                retain_graph=False,
-                create_graph=False,
-            )[0]
+    acts = activations[0]
+    grads = gradients[0]
+    weights = torch.mean(grads, dim=(2, 3), keepdim=True)
+    cam = torch.sum(weights * acts, dim=1, keepdim=True)
+    return F.relu(cam)
 
-        weights = gradients.mean(dim=(2, 3), keepdim=True)
-        cam = (weights * feature_maps).sum(dim=1, keepdim=True)
-        cam = F.relu(cam)
-        return cam.detach()
-    finally:
-        handle.remove()
-        model.zero_grad(set_to_none=True)
+def attention_fn(model, images, labels):
+    with torch.no_grad():
+        _ = model(images)
+    attn = model.transformer.last_attention
+    if attn.dim() == 4:
+        attn = attn.mean(dim=1)
+    cls_attn = attn[:, 0, 1:]
+    B, num_patches = cls_attn.shape
+    grid_size = int(np.sqrt(num_patches))
+    return cls_attn.reshape(B, 1, grid_size, grid_size)
 
-
-@torch.no_grad()
-def cls_attention_fn(model, images: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """
-    Extract CLS-token-to-patch attention from model.transformer.last_attention.
-
-    This is last-layer CLS attention. It is not multi-layer Attention Rollout
-    unless the model's implementation has already combined layer attentions.
-    """
-    _ = model(images)
-    attention = model.transformer.last_attention
-
-    if attention.ndim == 4:       # [B, heads, tokens, tokens]
-        attention = attention.mean(dim=1)
-    elif attention.ndim != 3:     # [B, tokens, tokens]
-        raise ValueError(f"Unexpected attention shape: {tuple(attention.shape)}")
-
-    cls_to_patches = attention[:, 0, 1:]
-    batch, patch_count = cls_to_patches.shape
-    grid = int(np.sqrt(patch_count))
-    if grid * grid != patch_count:
-        raise ValueError(
-            f"Patch count {patch_count} is not a square; provide a grid-aware reshape."
-        )
-    return cls_to_patches.reshape(batch, 1, grid, grid)
-
-
-def _weighted_summary(values: list[float]) -> tuple[float, float]:
-    arr = np.asarray(values, dtype=float)
-    return float(np.mean(arr)), float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
-
-
-def evaluate_explainability(
-    model,
-    test_loader,
-    device: torch.device,
-    gradcam_target_layer: Optional[torch.nn.Module] = None,
-    keep_ratio: float = 0.20,
-    deletion_insertion_steps: int = 20,
-    noise_std: float = 0.05,
-    seed: int = 42,
-    output_dir: str = "explainability_results",
-    method_names: tuple[str, str] = ("Grad-CAM", "CLS Attention"),
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Evaluate both explanation methods and save per-image and summary CSV files.
-
-    Returns:
-        per_image_df, summary_df
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    set_reproducibility(seed)
-    model.eval()
-
-    methods: list[tuple[str, Callable]] = [
-        (
-            method_names[0],
-            lambda m, x, y: gradcam_fn(
-                m, x, y, target_layer=gradcam_target_layer
-            ),
-        ),
-        (method_names[1], cls_attention_fn),
-    ]
-
-    per_image_rows = []
-
-    for method_name, explain_fn in methods:
-        sample_index = 0
+# --------------------------------------------------
+# 7. Complete evaluation
+# --------------------------------------------------
+def evaluate_explainability(model, test_loader, gradcam_fn, attention_fn):
+    results = []
+    for method, explain_fn in [
+        ("Grad-CAM", gradcam_fn),
+        ("Attention Rollout", attention_fn)
+    ]:
+        all_ad = []
+        all_ai = []
+        all_deletion = []
+        all_insertion = []
+        all_stability = []
 
         for images, labels in test_loader:
             images = images.to(device)
@@ -312,100 +247,47 @@ def evaluate_explainability(
             explanation = explain_fn(model, images, labels)
             explanation = normalize_explanation(explanation)
 
-            ad, ai = average_drop_increase_per_image(
-                model, images, explanation, labels, keep_ratio=keep_ratio
+            ad, ai = average_drop_increase(model, images, explanation, labels)
+            all_ad.append(ad)
+            all_ai.append(ai)
+
+            d_auc, i_auc = deletion_insertion_auc(model, images, explanation, labels)
+            all_deletion.append(d_auc)
+            all_insertion.append(i_auc)
+
+            perturbed_images = torch.clamp(
+                images + torch.randn_like(images) * 0.05,
+                -1, 1
             )
-            deletion, insertion = deletion_insertion_auc_per_image(
-                model, images, explanation, labels,
-                steps=deletion_insertion_steps,
-            )
+            with torch.enable_grad():
+                perturbed_explanation = explain_fn(model, perturbed_images, labels)
+            perturbed_explanation = normalize_explanation(perturbed_explanation)
 
-            # Use a reproducible perturbation for each batch. The same test
-            # images are traversed in the same order for both methods.
-            generator = torch.Generator(device=images.device)
-            generator.manual_seed(seed + sample_index)
-            noise = torch.randn(
-                images.shape,
-                generator=generator,
-                device=images.device,
-                dtype=images.dtype,
-            ) * noise_std
-            perturbed_images = torch.clamp(images + noise, -1.0, 1.0)
+            stability = explanation_stability(explanation, perturbed_explanation)
+            all_stability.append(stability)
 
-            perturbed_explanation = explain_fn(
-                model, perturbed_images, labels
-            )
-            stability = explanation_stability_per_image(
-                explanation, perturbed_explanation
-            )
+        results.append({
+            "Method": method,
+            "Average Drop (%)": np.mean(all_ad),
+            "Average Increase (%)": np.mean(all_ai),
+            "Deletion AUC": np.mean(all_deletion),
+            "Insertion AUC": np.mean(all_insertion),
+            "Stability (SSIM)": np.mean(all_stability)
+        })
+    return pd.DataFrame(results)
 
-            for j in range(images.shape[0]):
-                per_image_rows.append({
-                    "Method": method_name,
-                    "Test_Image_Index": sample_index + j,
-                    "Target_Class": int(labels[j].item()),
-                    "Average_Drop_pct": float(ad[j]),
-                    "Average_Increase_pct": float(ai[j]),
-                    "Deletion_AUC": float(deletion[j]),
-                    "Insertion_AUC": float(insertion[j]),
-                    "Stability_SSIM": float(stability[j]),
-                })
+results_df = evaluate_explainability(
+    model,
+    test_loader,
+    gradcam_fn,
+    attention_fn
+)
 
-            sample_index += images.shape[0]
+print("\nExplainability Evaluation Results")
+print(results_df.round(4))
 
-    per_image_df = pd.DataFrame(per_image_rows)
-    per_image_path = os.path.join(output_dir, "per_image_results.csv")
-    per_image_df.to_csv(per_image_path, index=False)
-
-    metric_columns = [
-        "Average_Drop_pct",
-        "Average_Increase_pct",
-        "Deletion_AUC",
-        "Insertion_AUC",
-        "Stability_SSIM",
-    ]
-    summary_rows = []
-    for method_name in [item[0] for item in methods]:
-        subset = per_image_df[per_image_df["Method"] == method_name]
-        row = {
-            "Method": method_name,
-            "Number_of_test_images": len(subset),
-        }
-        for metric in metric_columns:
-            mean, std = _weighted_summary(subset[metric].tolist())
-            row[f"{metric}_mean"] = mean
-            row[f"{metric}_std"] = std
-        summary_rows.append(row)
-
-    summary_df = pd.DataFrame(summary_rows)
-    summary_path = os.path.join(output_dir, "explainability_summary.csv")
-    summary_df.to_csv(summary_path, index=False)
-
-    print("\nExplainability summary (mean ± standard deviation)")
-    print(summary_df.round(6).to_string(index=False))
-    print(f"\nSaved per-image results: {per_image_path}")
-    print(f"Saved summary: {summary_path}")
-
-    return per_image_df, summary_df
-
-
-# ---------------------------------------------------------------------------
-# USAGE (run this from your existing NEU-DET experiment after model creation)
-# ---------------------------------------------------------------------------
-# model = FuzzyCNNViT(num_classes=num_classes).to(device)
-# model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-# model.eval()
-#
-# per_image_df, summary_df = evaluate_explainability(
-#     model=model,
-#     test_loader=test_loader,
-#     device=device,
-#     gradcam_target_layer=model.cnn[4],  # verify this is the intended final CNN conv layer
-#     keep_ratio=0.20,
-#     deletion_insertion_steps=20,
-#     noise_std=0.05,
-#     output_dir="NEU_DET_Explainability_Results",
-#     # Use ("Grad-CAM", "Attention Rollout") ONLY if your model's attention
-#     # implementation actually performs multi-layer rollout.
-#     method_names=("Grad-CAM", "CLS Attention"),
-# )
+results_df.to_csv(
+    "NEU_DET_Explainability_Metrics.csv",
+    index=False
+)
+print("\nResults saved successfully.")
