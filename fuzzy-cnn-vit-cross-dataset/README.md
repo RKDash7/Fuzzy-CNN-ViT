@@ -17,7 +17,7 @@ fuzzy-cnn-vit-cross-dataset/
 ├── experiments/
 │   └── neu_det/
 │       ├── README.md
-│       ├── neu_det_fuzzy_cnn_vit.py
+│       ├── Explainable_Fuzzy_CNN_ViT.py
 │       └── outputs/
 │           └── .gitkeep
 └── validation/
